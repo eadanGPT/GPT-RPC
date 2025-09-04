@@ -1,1 +1,354 @@
+Advanced WS Auth System — Full Security Blueprint (Pseudo-code)
+0) Security Standards & Controls (all applied)
 
+Transport: WSS over TLS 1.3, strong ciphers, HSTS on any bootstrap HTTPS page, ALPN http/1.1 or h2.
+
+Key Management:
+
+Ed25519 (sign/verify) in HSM/KMS or enclave (server) with key IDs (kid) + rotation.
+
+X25519 (ephemeral per module session) for ECDH.
+
+Public-key pinning on client (Ed25519 spki base64).
+
+Tokens & Claims: short-lived, Ed25519-signed, aud/iss/sub/exp/nbf/iat, scopes/roles, device binding (machineId, fingerprint), kid header, jti for revocation/replay control.
+
+Request Integrity: every WS message has nonce, ts, msgId, and is schema-validated; replay window protection + dedupe cache.
+
+Rate/Abuse Controls: IP + license key rate limits, token scoped quotas, exponential backoff on activate/login, circuit breakers.
+
+Protected Module: per-session ECDH→HKDF→AES-GCM, signed envelope, nonce+expiry binding, watermark, light obfuscation (plus optional bytenode/native addon).
+
+Verification: client verifies all server signatures with pinned Ed25519; server verifies token signature, expiry, revocation, scope.
+
+Logging & Audit: tamper-evident append-only logs (hash-chained), redaction, privacy budget, time-sync (NTP/secure clock).
+
+Operations: key rotation, revocation lists, license state changes, token refresh, clock skew tolerance, safe defaults.
+
+Storage: client secrets in OS keystore; server secrets in KMS/HSM; no plaintext keys on disk.
+
+DoS/Memory Safety: message size caps, queue limits, per-conn backpressure, graceful degradation.
+
+1) Data Schemas (wire contracts)
+Header := {
+  msgId: UUID,          // unique per-message
+  nonce: UUID,          // replay protection
+  ts:   int(ms),        // client/server clock; skew-checked
+  typ:  enum,           // "hello" | "activate" | "rpc" | "get_module" | "error" | ...
+  ver:  "1.0",          // protocol version
+}
+
+ActivateReq := Header & {
+  typ: "activate",
+  licenseKey: string,
+  machineId: string,    // device bind
+  deviceInfo: { os, arch, appVer, hwHash } // hashed/fingerprinted (no PII)
+}
+
+Activated := Header & {
+  typ: "activated",
+  token: JWS(Ed25519){ header:{ alg:"EdDSA", kid }, payload:{
+    iss:"ws-auth", aud:"client", sub:licenseKey,
+    iat, nbf, exp, jti, machineId, scopes:[...], plan
+  }},
+  exp: int(s),
+  ed25519PublicKeyB64: string, // for pinning (also sent in hello)
+  rotateAfter: int(s)          // client should refresh token or re-activate by this time
+}
+
+RpcReq := Header & {
+  typ: "rpc",
+  token: string,                // JWS
+  method: enum("priceModel","scoreUser", ...),
+  params: any
+}
+
+RpcRes := Header & {
+  typ: "rpc_result",
+  result: any,
+  sigB64: base64,               // Ed25519 over canonical(JSON(result, method, header.nonce, header.ts))
+  kid: string
+}
+
+GetModuleReq := Header & {
+  typ: "get_module",
+  token: string,                // JWS
+  clientPubX25519Pem: string,
+  bind: {
+    exp: int(ms),               // <= now + 60_000
+    watermark: string,          // license/machine/nonce affinity
+  }
+}
+
+ModuleRes := Header & {
+  typ: "module",
+  enc: { iv: base64, ciphertext: base64 },        // AES-GCM( sessionKey, boundSource )
+  envSigB64: base64,                               // Ed25519 over canonical({enc, bind, serverPubX25519})
+  serverKeys: { pubX25519Pem: string, kid: string, ed25519PublicKeyB64: string }
+}
+
+Error := Header & { typ:"error", code, message }
+
+
+Canonicalization rule for signatures: JSON with sorted keys, UTF-8, no whitespace variation.
+
+2) Server — Subsystems (pseudo)
+subsys KeyManager:
+  state:
+    ed25519Active: { kid, privRef(KMS), pubSpkiB64 }
+    ed25519Previous[] // for verify during rotation window
+  fn sign(bytes):
+    return KMS.Ed25519.sign(ed25519Active.privRef, bytes)
+  fn verify(kid, sig, bytes):
+    pub = (kid==active.kid ? active.pub : lookupPrevious(kid).pub)
+    return Ed25519.verify(pub, sig, bytes)
+  fn rotateEd25519():
+    new = KMS.generateEd25519()
+    set active=new; move old to previous with ttl
+
+subsys LicenseStore:
+  DB licenses{ key -> { status, plan, seats, expireAt, scopes[], revocations[] } }
+  fn check(key): ensure exists, active, not expired
+  fn recordUse(key, machineId, ts)
+  fn revoke(jti or key): append to revocations
+  fn isRevoked(jti or key): bool
+
+subsys TokenService:
+  fn issue(licenseKey, machineId, scopes):
+    now = now()
+    payload = { iss:"ws-auth", aud:"client", sub:licenseKey, iat:now, nbf:now-30s, exp:now+15m,
+                jti: uuid(), machineId, scopes, plan: licenses[key].plan }
+    header  = { alg:"EdDSA", kid: KeyManager.ed25519Active.kid, typ:"JWT" }
+    return JWS.sign(header, payload, KeyManager.sign)
+
+  fn verify(token):
+    (header, payload, sig) = JWS.parse(token)
+    assert header.alg=="EdDSA"
+    assert now() within [payload.nbf - skew, payload.exp + skew]
+    assert !LicenseStore.isRevoked(payload.jti) && !LicenseStore.isRevoked(payload.sub)
+    assert KeyManager.verify(header.kid, sig, JWS.signingInput(header, payload))
+    return payload
+
+subsys ReplayGuard:
+  // bounded LRU/set per (sub, machineId)
+  cache usedNonces[(sub,machineId)] : set<UUID> with ttl = 10m
+  fn checkAndStore(key, nonce, ts):
+    assert abs(now()-ts) < 60s
+    assert !usedNonces[key].contains(nonce)
+    usedNonces[key].add(nonce)
+
+subsys RateLimiter:
+  buckets by ip, licenseKey, token.sub
+  fn allow(tokenOrKey, weight=1): leaky-bucket/redis w/ quotas
+
+subsys RpcEngine:
+  fn priceModel(params): ... // sensitive kept server-side
+  fn scoreUser(params): ...
+
+subsys ModuleProtector:
+  fn obfuscate(src):
+    return xorRotate(src) + minify() + optional_bytenode()
+  fn bind(src, bindInfo, watermark):
+    return """
+      export const __nonce = "{Header.nonce}";
+      export const __exp   = {bindInfo.exp};
+      export const __watermark = "{watermark}";
+      """ + src
+  fn sessionKey(serverPrivX25519, clientPubX25519):
+    secret = ECDH(serverPrivX25519, clientPubX25519)
+    return HKDF(secret, salt="mod_v2", info="", len=256, alg="AES-GCM")
+  fn encrypt(sessionKey, boundSource):
+    iv = random(12)
+    ct = AESGCM.encrypt(key=sessionKey, iv, plaintext=utf8(boundSource))
+    return { iv: b64(iv), ciphertext: b64(ct) }
+  fn signEnvelope(enc, bind, serverPubX25519, kid):
+    payload = canonical({ enc, bind, serverPubX25519 })
+    sig = KeyManager.sign(utf8(payload))
+    return { envSigB64: b64(sig), kid }
+
+subsys AuditLog:
+  append hash-chained records { ts, msgId, actor, action, metaHash }
+
+3) Server — WS Handler (pseudo)
+onConnection(ws, req):
+  assert TLS13(req) && originAllowed(req.origin)
+  ip = req.ip
+  send(ws, hello{ ed25519PublicKeyB64: KeyManager.active.pubSpkiB64, protoVer:"1.0" })
+
+onMessage(ws, msg):
+  // 1) Parse + schema validate + size caps
+  assert size(msg) <= 64KB
+  obj = JSON.parse(msg); validateSchema(obj)
+
+  // 2) Shared header checks
+  ReplayGuard.checkAndStore( key=headerKey(obj), nonce=obj.nonce, ts=obj.ts )
+  RateLimiter.allow( actor(obj) )
+
+  switch obj.typ:
+
+    case "activate":
+      // authentication by license key
+      LicenseStore.check(obj.licenseKey)
+      tok = TokenService.issue(obj.licenseKey, obj.machineId, scopes=resolveScopes(...))
+      AuditLog.append({ actor:obj.licenseKey, action:"activate", meta:{ machineId: obj.machineId } })
+      send(ws, Activated{ token:tok, exp:payload.exp, ed25519PublicKeyB64: KeyManager.active.pubSpkiB64, rotateAfter: 10m })
+      break
+
+    case "rpc":
+      claims = TokenService.verify(obj.token)
+      require scopes(claims, "rpc:invoke")
+      RateLimiter.allow(claims.sub)
+      result = RpcEngine.dispatch(obj.method, obj.params)
+      payload = canonical({ method:obj.method, result, nonce:obj.nonce, ts:now() })
+      sig = KeyManager.sign(utf8(payload))
+      send(ws, RpcRes{ result, sigB64:b64(sig), kid:KeyManager.active.kid })
+      AuditLog.append({ actor:claims.sub, action:"rpc", meta:{ method:obj.method } })
+      break
+
+    case "get_module":
+      claims = TokenService.verify(obj.token)
+      require scopes(claims, "module:get")
+      assert 0 < obj.bind.exp - now() <= 60_000
+      serverX = X25519.generate() // ephemeral per request
+      src = loadProtectedSource()
+      obf = ModuleProtector.obfuscate(src)
+      bound = ModuleProtector.bind(obf, obj.bind, watermark=mkWatermark(claims, obj))
+      key  = ModuleProtector.sessionKey(serverX.priv, obj.clientPubX25519Pem)
+      enc  = ModuleProtector.encrypt(key, bound)
+      env  = ModuleProtector.signEnvelope(enc, obj.bind, serverX.pub, KeyManager.active.kid)
+      send(ws, ModuleRes{ enc, envSigB64:env.envSigB64, serverKeys:{ pubX25519Pem:serverX.pub, kid:KeyManager.active.kid, ed25519PublicKeyB64:KeyManager.active.pubSpkiB64 } })
+      AuditLog.append({ actor:claims.sub, action:"module_delivered" })
+      break
+
+    default:
+      send(ws, Error{ code:"bad_type", message:"Unsupported message typ" })
+
+
+Implementation notes:
+
+headerKey(obj) := (obj.token?.sub || obj.licenseKey) + ":" + (obj.machineId || "unknown")
+
+Clock skew: allow ±60s window; if outside, ask client to resync/retry.
+
+4) Client — Subsystems (pseudo)
+subsys PinStore:
+  read/write pinnedEd25519SpkiB64 (secure storage)
+  fn ensurePinned(pubB64):
+    if empty -> store(pubB64)
+    else assert == stored
+
+subsys WSClient:
+  connect(url=wss://host:port?apiKey=..., subprotocol="app/1.0")
+  on open -> wait hello
+
+subsys TokenCache:
+  hold { token, exp, rotateAfter }; persist minimally (keychain)
+  fn validSoon(): exp - now() > 60s
+  fn ensure(ws, licenseKey, machineId):
+    if empty or !validSoon(): send activate, await activated, pin Key
+
+subsys SignVerify:
+  fn verifyServerSig(pubB64, kid, payloadStr, sigB64): Ed25519.verify
+
+subsys ReplayCache:
+  ttl set<nonce> 10m
+
+subsys RPC:
+  fn call(method, params):
+    nonce = uuid(); ReplayCache.add(nonce)
+    msg = RpcReq{ token:TokenCache.token, params, method, header(nonce) }
+    ws.send(msg)
+    res = await ws.recv("rpc_result", msg.msgId)
+    payload = canonical({ method, result:res.result, nonce, ts:res.ts })
+    assert SignVerify.verifyServerSig(PinStore.pinned, res.kid, payload, res.sigB64)
+    return res.result
+
+subsys ModuleClient:
+  fn fetchAndLoad():
+    gen X25519 keypair (clientX)
+    bind = { exp: now()+60_000, watermark: mkWatermark(machineId, licenseKey) }
+    nonce = uuid()
+    send GetModuleReq{ token, clientPubX25519Pem: clientX.pub, bind, header(nonce) }
+    res = await ws.recv("module", msgId)
+    // Verify envelope signature first
+    canonicalPayload = canonical({ enc:res.enc, bind, serverPubX25519: res.serverKeys.pubX25519Pem })
+    assert SignVerify.verifyServerSig(PinStore.pinned, res.serverKeys.kid, canonicalPayload, res.envSigB64)
+    // Derive and decrypt
+    sessionKey = ECDH->HKDF(clientX.priv, res.serverKeys.pubX25519Pem)
+    source = AESGCM.decrypt(sessionKey, res.enc)
+    assert source contains bind.watermark && bind.exp && nonce
+    module = dynamicImportFromMemory(source) // or temp file
+    return module
+
+
+Header helper:
+
+fn header(nonce):
+  return { msgId: uuid(), nonce, ts: now(), typ: <filled_by_caller>, ver:"1.0" }
+
+5) Threat Mitigations (mapping)
+
+MITM / Impersonation: TLS 1.3 + key pinning + signed messages.
+
+Replay: per-message nonce + ts with skew window + dedupe cache.
+
+Token theft: short exp, device binding, revocation on anomaly, refresh discipline.
+
+Module leak/tamper: per-session ECDH encryption, signed envelope, nonce/exp binding, watermark.
+
+Brute/DoS: rate limits, connection caps, message size caps, exponential backoff.
+
+Key compromise: rotation with KIDs, previous-key verify window, server-side KMS/HSM.
+
+Auditability: hash-chained logs with minimal PII.
+
+6) End-to-End Flow (Diagram)
+Client                                                Server
+  |                                                     |
+  |==== WSS (TLS 1.3) connect ?apiKey=... =============>|
+  |                                                     |
+  |<=== hello{pubSpkiB64, protoVer} ====================|
+  |  PinStore.ensurePinned(pubSpkiB64)                  |
+  |                                                     |
+  |-- activate{licenseKey,machineId,nonce,ts} --------->|
+  |                                                     | LicenseStore.check()
+  |                                                     | TokenService.issue(kid, jti, exp, scopes, device bind)
+  |<-- activated{token,exp,rotateAfter,pubSpkiB64} -----|
+  |  TokenCache.store(); PinStore.ensurePinned()        |
+  |                                                     |
+  |-- rpc{token,method,params,nonce,ts} --------------->|
+  |                                                     | TokenService.verify(token)
+  |                                                     | result = RpcEngine.dispatch()
+  |                                                     | sig = Sign(payload, kid)
+  |<-- rpc_result{result,sigB64,kid,nonce,ts} ----------|
+  |  VerifySig(pinned, kid, payload, sigB64)            |
+  |                                                     |
+  |-- get_module{token,clientPubX,bind,nonce,ts} ------>|
+  |                                                     | serverX = X25519()
+  |                                                     | key = ECDH->HKDF(serverX.priv, clientPubX)
+  |                                                     | boundSrc = bind(src, nonce, bind.exp, watermark)
+  |                                                     | enc = AES-GCM(key, boundSrc)
+  |                                                     | envSigB64 = Sign(canonical({enc, bind, serverX.pub}), kid)
+  |<-- module{enc, envSigB64, serverKeys{pubX,kid}} ----|
+  |  VerifySig(pinned, kid, canonical(...), envSigB64)  |
+  |  key = ECDH->HKDF(clientX.priv, serverKeys.pubX)    |
+  |  src = AES-GCM.decrypt(key, enc)                    |
+  |  assert watermark/nonce/exp present                 |
+  |  module = dynamicImport(src)                        |
+  |                                                     |
+  |  // use module + continue signed RPCs               |
+  |                                                     |
+
+7) Optional Enhancements
+
+mTLS between reverse-proxy and service mesh; client mutual-TLS if appropriate.
+
+SCITT/Transparency log for published server public keys and releases.
+
+TUF-like metadata for module delivery (targets.json + signature threshold).
+
+Bytenode / Native addon for heavier client-side protection.
+
+OPA/Rego or ABAC for fine-grained authorization of RPC methods.
+
+if you’d like, I can turn this blueprint into an annotated Mermaid diagram and a checklist you can hand to security review/QA.
