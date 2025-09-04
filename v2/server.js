@@ -674,3 +674,22 @@ export const version = "1.0.0";
       }
     });
   } catch (err) {
+    console.error('connection error', err);
+    try {
+      ws?.send(JSON.stringify(errorMsg('internal', 'Internal error')));
+      ws?.close();
+    } catch {}
+  }
+});
+
+function errorMsg(code, message) {
+  return {
+    msgId: uuidv4(),
+    nonce: uuidv4(),
+    ts: nowMs(),
+    typ: 'error',
+    ver: CONFIG.protocolVersion,
+    code,
+    message,
+  };
+}
